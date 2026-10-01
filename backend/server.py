@@ -13,14 +13,12 @@ Endpoints:
 import asyncio
 import collections
 import json
-import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import requests
 import serial_asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,21 +27,19 @@ from pydantic import BaseModel
 from csi_parser import CSIFeatureExtractor
 from profiles import ProfileStore
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SERIAL_PORT   = "/dev/ttyACM0"   # Change to your ESP32 serial port
-BAUD_RATE     = 115200
-DEMO_MODE     = False             # Set True to test without hardware
-SENSITIVE     = [19,20,21,22,23,24,25,26,38,39]
-N_SUBCARRIERS = 64
-WINDOW        = 30
-CALIB_FRAMES  = 100
-COOLDOWN_SECS = 5
-BROADCAST_INTERVAL = 0.1   # max broadcast rate: 10 fps to avoid lag
-CONFIRM_FRAMES = 8          # frames above threshold needed to confirm real motion (~0.8s at 10fps)
-CLEAR_FRAMES   = 12         # frames below threshold needed to confirm room is clear
+# ── src package imports ───────────────────────────────────────────────────────
+from src.config import (
+    SERIAL_PORT, BAUD_RATE, DEMO_MODE, SENSITIVE, WINDOW, CALIB_FRAMES,
+    CONFIRM_FRAMES, CLEAR_FRAMES, BROADCAST_INTERVAL, COOLDOWN_SECS,
+    ACTIVITY_VAR_WINDOW,
+)
+from src.signal import parse_csi_line, classify_activity
+from src.alerts import send_telegram
+from src.state import initial_state
+from src.utils import sanitize as _sanitize
 
-TELEGRAM_TOKEN   = "8653748907:AAGuS-6WWqgIUwGgYIYHKtQbfCfPD5s-ER8"
-TELEGRAM_CHAT_ID = "5603958342"
+# ── Config ────────────────────────────────────────────────────────────────────
+# All constants are now defined in src/config.py and imported above.
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 store     = ProfileStore()
@@ -54,27 +50,9 @@ dashboard_clients: list[WebSocket] = []
 enrolling_name: str | None = None
 event_log: list[dict] = []   # last 100 crossing events
 
-# Dashboard state (mirrors csi_receiver/app.py state dict)
-cfg = {"threshold_mul": 2.0, "mute_until": 0.0}
-state = {
-    "variance":       0.0,
-    "status":         "clear",
-    "threshold":      0.0,
-    "baseline":       0.0,
-    "threshold_mul":  2.0,
-    "occupied_since": None,
-    "session": {
-        "motion_events":  0,
-        "uptime_s":       0,
-        "avg_clear_var":  0.0,
-        "avg_motion_var": 0.0,
-    },
-    "subcarriers":  [0.0] * len(SENSITIVE),
-    "heatmap":      [0] * 24,
-    "calibrating":  True,
-    "activity":     "unknown",      # AI-detected activity class
-    "activity_conf": 0.0,            # confidence 0.0-1.0
-}
+# Dashboard state — initialized from src.state
+cfg   = {"threshold_mul": 2.0, "mute_until": 0.0}
+state = initial_state()
 _calib_vars:  list[float] = []
 _clear_vars:  list[float] = []
 _motion_vars: list[float] = []
@@ -87,120 +65,22 @@ _below_count     = 0   # consecutive frames below threshold
 _confirmed_motion = False  # True once CONFIRM_FRAMES sustained
 recalibrate_flag = asyncio.Event()
 
-# ── Variance history for activity classification ───────────────────────────────
-# Keep a rolling 3-second window of variance values to detect activity type
-ACTIVITY_VAR_WINDOW = 60   # ~3s at 20fps
+# ── Variance history for activity classification ─────────────────────────────
+# Rolling window fed to classify_activity() from src.signal
 _var_history: collections.deque = collections.deque(maxlen=ACTIVITY_VAR_WINDOW)
 # Calibrated empty-room variance (used as floor reference)
 _empty_var_mean = 0.0
 _empty_var_std  = 0.0
 
 
-def classify_activity(var_history: list[float], baseline: float, threshold: float) -> tuple[str, float]:
-    """
-    Classify activity from recent variance history instead of single-frame amplitudes.
-    
-    Uses the ratio and pattern of variance relative to the calibrated baseline:
-      - empty     : variance stays near baseline (ratio < 1.3)
-      - breathing : tiny periodic variance just above baseline (ratio 1.3–2.5, low std)
-      - stationary: small sustained offset above baseline (ratio 2.5–4.0)
-      - walking   : large irregular spikes (ratio > 4.0 or high std-of-var)
-      - fall      : sudden large spike followed by drop to near-baseline
-    """
-    if len(var_history) < 10 or baseline <= 0:
-        return "unknown", 0.0
-
-    arr = np.array(var_history, dtype=float)
-    mean_var   = float(np.mean(arr))
-    std_var    = float(np.std(arr))
-    max_var    = float(np.max(arr))
-    ratio      = mean_var / (baseline + 1e-9)
-    cv         = std_var / (mean_var + 1e-9)   # coefficient of variation
-
-    # Check for fall: large spike in the first half, drops off in the second half
-    half = len(arr) // 2
-    if len(arr) >= 20:
-        first_mean  = float(np.mean(arr[:half]))
-        second_mean = float(np.mean(arr[half:]))
-        spike_ratio = first_mean / (second_mean + 1e-9)
-        if max_var > threshold * 2.5 and spike_ratio > 2.5 and second_mean < threshold * 1.5:
-            return "fall", min(0.5 + spike_ratio * 0.05, 0.95)
-
-    # Walking: high variance with high variability (lots of movement-driven spikes)
-    if ratio > 3.5 or (ratio > 2.0 and cv > 0.5):
-        conf = min(0.5 + (ratio - 3.5) * 0.1 + cv * 0.2, 0.95)
-        return "walking", round(conf, 3)
-
-    # Stationary: elevated but stable variance (person present, not moving much)
-    if 2.0 < ratio <= 3.5 and cv < 0.5:
-        conf = min(0.5 + (ratio - 2.0) * 0.15, 0.85)
-        return "stationary", round(conf, 3)
-
-    # Breathing: small variance just above baseline, low variability
-    if 1.3 < ratio <= 2.0 and cv < 0.4:
-        conf = min(0.5 + (ratio - 1.3) * 0.3, 0.80)
-        return "breathing", round(conf, 3)
-
-    # Empty: variance at or near baseline
-    if ratio <= 1.3:
-        conf = min(0.5 + (1.3 - ratio) * 0.5, 0.95)
-        return "empty", round(conf, 3)
-
-    return "stationary", 0.4
+# classify_activity is now imported from src.signal
 
 
-# ── CSI line parser (matches ESP32 LLTF output) ───────────────────────────────
-def parse_csi_line(line: str):
-    """
-    Parse a raw ESP32 CSI line.
-    Handles both bare format:  CSI,<ts>,<rssi>,<noise>,<len>,<bytes...>
-    And ESP-IDF log prefix:    I (1234) csi: CSI,<ts>,...
-    Returns (aggregate_amplitude, subcarrier_amplitudes) or None.
-    """
-    line = line.strip()
-    # Strip ESP-IDF log prefix if present (e.g. "I (1234) csi: CSI,...")
-    if "CSI," in line:
-        line = line[line.index("CSI,"):]
-    elif not line.startswith("CSI"):
-        return None
-    parts = line.split(",")
-    if len(parts) < 8:
-        return None
-    try:
-        length = int(parts[4])
-        raw    = [int(x) for x in parts[5:5 + length]]
-    except (ValueError, IndexError):
-        return None
-
-    amps = []
-    for i in range(0, len(raw) - 1, 2):
-        im, re = raw[i], raw[i + 1]
-        if im > 127: im -= 256
-        if re > 127: re -= 256
-        amps.append(math.sqrt(re**2 + im**2))
-
-    sensitive_amps = [amps[i] for i in SENSITIVE if i < len(amps)]
-    if not sensitive_amps:
-        return None
-
-    aggregate = float(np.mean(sensitive_amps))
-    return aggregate, sensitive_amps
+# parse_csi_line is now imported from src.signal
 
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def send_telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if time.time() < cfg["mute_until"]:
-        return
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            params={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=3,
-        )
-    except Exception:
-        pass
+# send_telegram is now imported from src.alerts
+# (mute_until is passed in from cfg at call sites below)
 
 
 # ── Broadcast helper ──────────────────────────────────────────────────────────
@@ -396,9 +276,10 @@ async def _process_frame(agg: float, sc_amps: list[float], threshold: float):
             state["session"]["motion_events"] += 1
             state["heatmap"][hour] += 1
         _motion_vars.append(current_var)
-        if now - _last_alert > COOLDOWN_SECS:
-            send_telegram(f"🚨 Motion detected! (var={current_var:.2f})")
-            _last_alert = now
+        send_telegram(
+            f"🚨 Motion detected! (var={current_var:.2f})",
+            mute_until=cfg["mute_until"],
+        )
     else:
         status = "clear"
         if not _confirmed_motion:
@@ -431,17 +312,7 @@ async def _process_frame(agg: float, sc_amps: list[float], threshold: float):
     await _process_identity(current_var, sc_amps_fixed)
 
 
-def _sanitize(obj):
-    """Recursively replace nan/inf floats so JSON serialization never fails."""
-    if isinstance(obj, float):
-        if obj != obj or obj == float('inf') or obj == float('-inf'):
-            return 0.0
-        return obj
-    if isinstance(obj, dict):
-        return {k: _sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize(v) for v in obj]
-    return obj
+# _sanitize is now imported from src.utils as _sanitize
 
 
 async def _process_identity(agg: float, sc_amps: list[float]):
