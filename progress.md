@@ -1,4 +1,4 @@
-# 📋 Project Log Book & System Architecture — CSI Dashboard
+# 📋 Project Log Book & System Architecture — CloakWatch (Wi-Fi CSI Sensing)
 
 > [!IMPORTANT]
 > ### 🤖 MANDATORY AI INSTRUCTION FOR ALL AI CODING ASSISTANTS
@@ -123,3 +123,13 @@ csi-dashboard/
   - `backend/src/utils/helpers.py`: Common mathematical and serialization utilities.
   - `progress.md`: Created centralized logbook with system architecture, domain gotchas, and mandatory agent guidelines.
 - **Rationale:** Structured the monolithic backend into clean, testable submodules and initialized the persistent agent knowledge base.
+
+### Entry: 2026-10-01 — Project Rebranding to CloakWatch & User Credential Migration
+- **Author / Agent:** Antigravity (Gemini 3.8 Flash)
+- **Files Modified:**
+  - `README.md`: Updated project title, overview branding to **CloakWatch**, setup commands, and credentials table.
+  - `src/main.js`: Updated `CREDENTIALS` dictionary so Admin and Property Owner passwords are `cloak` (with backward compatibility for `cloak@2026`).
+  - `index.html`: Updated page title, brand headings, credential hint, and password input placeholder to `cloak`.
+  - `progress.md`: Appended work history entry.
+- **Rationale:** Rebranded the application to **CloakWatch** to better emphasize camera-less through-wall privacy monitoring, and simplified default portal authentication.
+

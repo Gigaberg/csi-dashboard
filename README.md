@@ -1,6 +1,6 @@
-# Techflix — Wi-Fi CSI Presence & Activity Detection
+# CloakWatch — Wi-Fi CSI Presence & Activity Detection
 
-A real-time, camera-free presence detection system using Wi-Fi CSI (Channel State Information) from ESP32-S3 microcontrollers. When someone moves in a room, it disturbs the Wi-Fi signal — Techflix detects that disturbance, classifies the activity, and alerts you instantly.
+A real-time, camera-free presence detection system using Wi-Fi CSI (Channel State Information) from ESP32-S3 microcontrollers. When someone moves in a room, it disturbs the Wi-Fi signal — CloakWatch detects that disturbance, classifies the activity, and alerts you instantly.
 
 ---
 
@@ -61,7 +61,7 @@ CSI,<timestamp>,<rssi>,<noise_floor>,<length>,<raw IQ bytes...>
 ## Backend Setup
 
 ```bash
-cd Techflix/backend
+cd backend
 pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8000
 ```
@@ -79,7 +79,6 @@ Hosted on Render. Built with Vite + vanilla JS + Chart.js.
 
 To run locally:
 ```bash
-cd Techflix
 npm install
 npm run dev
 ```
@@ -111,10 +110,10 @@ wss://your-ngrok-url.ngrok-free.app/ws
 
 ## Dashboard Login
 
-| Role           | Username | Password    |
-|----------------|----------|-------------|
-| Admin          | admin    | saygex@2026 |
-| Property Owner | owner    | saygex@2026 |
+| Role           | Username | Password |
+|----------------|----------|----------|
+| Admin          | admin    | cloak    |
+| Property Owner | owner    | cloak    |
 
 Admin has full controls (recalibrate, sensitivity, mute, export).
 Property Owner is view-only.
